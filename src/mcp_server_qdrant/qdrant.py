@@ -78,13 +78,26 @@ class QdrantConnector:
 
         # Add to Qdrant
         vector_name = self._embedding_provider.get_vector_name()
-        payload = {"document": entry.content, METADATA_PATH: entry.metadata}
+        
+        # Handle both named vectors and single vector collections
+        if vector_name:
+            # Named vector collection (new format)
+            vector_data = {vector_name: embeddings[0]}
+            payload = {"document": entry.content, METADATA_PATH: entry.metadata}
+        else:
+            # Single vector collection (legacy compatibility)
+            vector_data = embeddings[0]
+            # Use legacy format with 'text' field for compatibility
+            payload = {"text": entry.content}
+            if entry.metadata:
+                payload.update(entry.metadata)
+        
         await self._client.upsert(
             collection_name=collection_name,
             points=[
                 models.PointStruct(
                     id=uuid.uuid4().hex,
-                    vector={vector_name: embeddings[0]},
+                    vector=vector_data,
                     payload=payload,
                 )
             ],
@@ -121,21 +134,48 @@ class QdrantConnector:
         vector_name = self._embedding_provider.get_vector_name()
 
         # Search in Qdrant
-        search_results = await self._client.query_points(
-            collection_name=collection_name,
-            query=query_vector,
-            using=vector_name,
-            limit=limit,
-            query_filter=query_filter,
-        )
-
-        return [
-            Entry(
-                content=result.payload["document"],
-                metadata=result.payload.get("metadata"),
+        # Handle both named vectors and single vector collections
+        if vector_name:
+            # Named vector collection
+            search_results = await self._client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                using=vector_name,
+                limit=limit,
+                query_filter=query_filter,
             )
-            for result in search_results.points
-        ]
+        else:
+            # Single vector collection (legacy compatibility)
+            search_results = await self._client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                limit=limit,
+                query_filter=query_filter,
+            )
+
+        entries = []
+        for result in search_results.points:
+            # Handle different payload structures
+            if "document" in result.payload:
+                # New format (MCP server format)
+                content = result.payload["document"]
+                metadata = result.payload.get("metadata")
+            elif "text" in result.payload:
+                # Legacy format (existing database format)
+                content = result.payload["text"]
+                # Extract metadata from other fields
+                metadata = {
+                    k: v for k, v in result.payload.items() 
+                    if k != "text"
+                }
+            else:
+                # Fallback: use entire payload as content
+                content = str(result.payload)
+                metadata = None
+            
+            entries.append(Entry(content=content, metadata=metadata))
+        
+        return entries
 
     async def _ensure_collection_exists(self, collection_name: str):
         """
